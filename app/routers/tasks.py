@@ -6,7 +6,7 @@ import copy
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy import case, func
-from sqlalchemy.orm import joinedload
+from sqlalchemy.orm import joinedload, selectinload
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.auth import CurrentUser, ManagerUser, DbSession, user_is_manager, user_is_supervisor, can_view_campaign
@@ -16,7 +16,11 @@ from app.serializers import task_out, resolve_sequence_number
 from app.media_rules import normalize_service_type
 from app.services.pdf import build_task_pdf
 from app.services.geo import within_radius, haversine_km
-from app.media_rules import slots_for, detail_form_for, slot_label, photos_for, campaign_radius_km
+from app.media_rules import slots_for, detail_form_for, slot_label, photos_for, campaign_radius_km, is_creative
+from app.models import CreativeVerificationStatus
+from app.config import get_settings
+from app.services.creative import RESUBMITTABLE, EXECUTOR_OPEN, record_proof, clear_proof
+from app.services.creative_jobs import enqueue_task_verification
 from app.services.storage import storage
 
 router = APIRouter(prefix="/api", tags=["tasks"])
@@ -244,6 +248,7 @@ def add_proof(task_id: UUID, payload: ProofImageCreate, db: DbSession, user: Cur
     images = [img for img in (meta.get("images") or []) if isinstance(img, dict)]
     have = {img.get("slot") for img in images}
     idx = slots.index(payload.slot)
+    creative = task.creative if is_creative(service) else None
 
     # Executors must capture in order; managers may fill/replace any slot.
     if not is_manager:
@@ -253,16 +258,27 @@ def add_proof(task_id: UUID, payload: ProofImageCreate, db: DbSession, user: Cur
                     status_code=400,
                     detail=f"Capture {slot_label(prior)} before {slot_label(payload.slot)}",
                 )
-        if payload.slot in have:
+        if creative is not None:
+            # Creative proofs may be re-uploaded after a failed / unclear verification.
+            if creative.verificationStatus not in RESUBMITTABLE:
+                detail = (
+                    "Proof already verified"
+                    if creative.verificationStatus == CreativeVerificationStatus.VERIFIED
+                    else "Proof is awaiting verification"
+                )
+                raise HTTPException(status_code=400, detail=detail)
+        elif payload.slot in have:
             raise HTTPException(
                 status_code=400, detail=f"{slot_label(payload.slot)} already uploaded"
             )
-    elif payload.slot in have:
+    if payload.slot in have:
         images = [img for img in images if img.get("slot") != payload.slot]
 
-    # Managers may upload from the office — skip geofence enforcement.
+    # Managers may upload from the office — skip geofence enforcement. Creative proofs
+    # are accepted as captured; the code check later decides whether they pass.
     if (
         not is_manager
+        and creative is None
         and campaign.latitude is not None
         and campaign.longitude is not None
     ):
@@ -304,8 +320,14 @@ def add_proof(task_id: UUID, payload: ProofImageCreate, db: DbSession, user: Cur
     _set_meta(task, meta)
     if not task.startedAt:
         task.startedAt = datetime.utcnow()
-    _maybe_complete(task)
+    if creative is not None:
+        # Completion waits for the code check (scheduled job, or immediately if enabled).
+        record_proof(task, creative, payload.storage_key, payload.url)
+    else:
+        _maybe_complete(task)
     db.commit()
+    if creative is not None and get_settings().creative_verify_on_upload:
+        enqueue_task_verification(task.id)
     return ProofImageOut(
         url=storage.viewable_url(entry["url"], entry.get("key")),
         slot=entry["slot"],
@@ -333,7 +355,9 @@ def delete_proof(task_id: UUID, slot: str, db: DbSession, user: CurrentUser):
     meta["images"] = images
     _set_meta(task, meta)
     service = task.campaign.serviceType if task.campaign else None
-    if not _photos_done(meta, service) or not _details_done(meta, detail_form_for(service)):
+    if is_creative(service) and task.creative:
+        clear_proof(task, task.creative)
+    elif not _photos_done(meta, service) or not _details_done(meta, detail_form_for(service)):
         task.status = TaskStatus.PENDING
         task.completedAt = None
     db.commit()
@@ -409,6 +433,10 @@ def _executor_task_open(meta: dict, service_type: str | None) -> bool:
 def _find_next_open_task_id(tasks: list[Task]) -> UUID | None:
     for task in tasks:
         service = task.campaign.serviceType if task.campaign else None
+        if is_creative(service) and task.creative:
+            if task.creative.verificationStatus in EXECUTOR_OPEN:
+                return task.id
+            continue
         if _executor_task_open(_meta(task), service):
             return task.id
     return None
@@ -424,7 +452,11 @@ def my_tasks(
 ):
     base_q = (
         db.query(Task)
-        .options(joinedload(Task.executor), joinedload(Task.campaign))
+        .options(
+            joinedload(Task.executor),
+            joinedload(Task.campaign),
+            selectinload(Task.creative),
+        )
         .filter(Task.executorUserId == user.id)
     )
     if campaign_id:

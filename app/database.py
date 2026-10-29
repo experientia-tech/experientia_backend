@@ -1,4 +1,6 @@
-from sqlalchemy import create_engine
+from contextlib import contextmanager
+
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 
 from app.config import get_settings
@@ -45,3 +47,26 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+@contextmanager
+def advisory_lock(key: int):
+    """Postgres session advisory lock so only one ECS instance runs a job.
+
+    Yields False when another instance holds it. SQLite (local dev) always yields True.
+    """
+    if settings.is_sqlite:
+        yield True
+        return
+    conn = engine.connect()
+    try:
+        got = bool(conn.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": key}).scalar())
+        conn.commit()
+        try:
+            yield got
+        finally:
+            if got:
+                conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": key})
+                conn.commit()
+    finally:
+        conn.close()

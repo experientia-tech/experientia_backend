@@ -12,6 +12,7 @@ from sqlalchemy import (
     Boolean,
     Enum,
     DateTime,
+    false,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -143,6 +144,9 @@ class Campaign(Base):
     tasks: Mapped[list["Task"]] = relationship(
         back_populates="campaign", cascade="all, delete-orphan"
     )
+    creative: Mapped["CreativeCampaign | None"] = relationship(
+        back_populates="campaign", uselist=False, cascade="all, delete-orphan", passive_deletes=True
+    )
 
 
 class CampaignMember(Base):
@@ -195,3 +199,113 @@ class Task(Base):
 
     campaign: Mapped["Campaign"] = relationship(back_populates="tasks")
     executor: Mapped["User"] = relationship(back_populates="tasks")
+    creative: Mapped["CreativeTask | None"] = relationship(
+        back_populates="task", uselist=False, cascade="all, delete-orphan", passive_deletes=True
+    )
+
+
+class CreativeGenerationStatus(str, enum.Enum):
+    PENDING = "PENDING"
+    PROCESSING = "PROCESSING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
+class CreativeVerificationStatus(str, enum.Enum):
+    NOT_SUBMITTED = "NOT_SUBMITTED"
+    PENDING_VERIFICATION = "PENDING_VERIFICATION"
+    VERIFIED = "VERIFIED"
+    FAILED = "FAILED"
+    NEEDS_REVIEW = "NEEDS_REVIEW"
+
+
+class CreativeDetectionMethod(str, enum.Enum):
+    QR = "QR"
+    OCR = "OCR"
+    MANUAL = "MANUAL"
+
+
+def _text_enum(cls):
+    # Stored as TEXT (not a Postgres enum type) — tables are created in main.py.
+    return Enum(cls, native_enum=False, length=32)
+
+
+class CreativeCampaign(Base):
+    """Creative-only campaign data — side table so the Prisma Campaign table is untouched."""
+
+    __tablename__ = "CreativeCampaign"
+
+    campaignId: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("Campaign.id", ondelete="CASCADE"), primary_key=True
+    )
+    sourceImageKey: Mapped[str] = mapped_column(Text, nullable=False)
+    sourceImageUrl: Mapped[str] = mapped_column(Text, nullable=False)
+    generationStatus: Mapped[CreativeGenerationStatus] = mapped_column(
+        _text_enum(CreativeGenerationStatus), default=CreativeGenerationStatus.PENDING
+    )
+    generatedCount: Mapped[int] = mapped_column(Integer, default=0)
+    generationError: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # One-page-per-task PDF for printing, rebuilt after every generation run.
+    printPdfKey: Mapped[str | None] = mapped_column(Text, nullable=True)
+    printPdfPages: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    printPdfAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    createdAt: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    updatedAt: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+
+    campaign: Mapped["Campaign"] = relationship(back_populates="creative")
+
+
+class CreativeTask(Base):
+    """Per-task verification code, generated creative and proof verification state."""
+
+    __tablename__ = "CreativeTask"
+
+    taskId: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("Task.id", ondelete="CASCADE"), primary_key=True
+    )
+    campaignId: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("Campaign.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Optional: if generation fails a manager can set it later from the task page.
+    verificationCode: Mapped[str | None] = mapped_column(Text, nullable=True, unique=True)
+    generatedImageKey: Mapped[str | None] = mapped_column(Text, nullable=True)
+    generatedImageUrl: Mapped[str | None] = mapped_column(Text, nullable=True)
+    proofImageKey: Mapped[str | None] = mapped_column(Text, nullable=True)
+    proofImageUrl: Mapped[str | None] = mapped_column(Text, nullable=True)
+    proofUploadedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    verificationStatus: Mapped[CreativeVerificationStatus] = mapped_column(
+        _text_enum(CreativeVerificationStatus),
+        default=CreativeVerificationStatus.NOT_SUBMITTED,
+        index=True,
+    )
+    detectedCode: Mapped[str | None] = mapped_column(Text, nullable=True)
+    detectionMethod: Mapped[CreativeDetectionMethod | None] = mapped_column(
+        _text_enum(CreativeDetectionMethod), nullable=True
+    )
+    ocrConfidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # The last automatic check found no code belonging to any task in the proof photo.
+    codeMissing: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    verificationAttempts: Mapped[int] = mapped_column(Integer, default=0)
+    verifiedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    verificationNotes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    createdAt: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    updatedAt: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+
+    task: Mapped["Task"] = relationship(back_populates="creative")
+
+
+class CreativeVerificationLog(Base):
+    __tablename__ = "CreativeVerificationLog"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    taskId: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("Task.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    attemptAt: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    method: Mapped[str | None] = mapped_column(Text, nullable=True)
+    rawText: Mapped[str | None] = mapped_column(Text, nullable=True)
+    detectedCode: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ocrConfidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    result: Mapped[str] = mapped_column(Text, nullable=False)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    actorUserId: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)

@@ -9,8 +9,12 @@ SERVICE_TYPES = [
     "No Parking Boards",
     "Pole Boards",
     "Shop Branding",
+    "Creative",
     "Other",
 ]
+
+# Code-stamped creative per task; proofs are verified by QR/OCR (app/services/creative.py)
+CREATIVE_SERVICE = "Creative"
 
 PHOTOS_REQUIRED: dict[str, int] = {
     "Auto Hood": 3,
@@ -18,6 +22,7 @@ PHOTOS_REQUIRED: dict[str, int] = {
     "No Parking Boards": 1,
     "Pole Boards": 1,
     "Shop Branding": 1,
+    "Creative": 1,
     "Other": 3,
 }
 
@@ -27,6 +32,7 @@ CAPTURE_SLOTS: dict[str, list[str]] = {
     "No Parking Boards": ["photo_1"],
     "Pole Boards": ["photo_1"],
     "Shop Branding": ["photo_1"],
+    "Creative": ["photo_1"],
     "Other": ["photo_1", "photo_2", "photo_3"],
 }
 
@@ -46,6 +52,7 @@ DETAIL_FORM: dict[str, str | None] = {
     "No Parking Boards": None,
     "Pole Boards": None,
     "Shop Branding": None,
+    "Creative": None,
     "Other": None,
 }
 
@@ -82,7 +89,13 @@ def normalize_service_type(value: str | None) -> str:
         return "Pole Boards"
     if "shop" in v:
         return "Shop Branding"
+    if "creative" in v:
+        return CREATIVE_SERVICE
     return value if value in PHOTOS_REQUIRED else "Other"
+
+
+def is_creative(service_type: str | None) -> bool:
+    return normalize_service_type(service_type) == CREATIVE_SERVICE
 
 
 def photos_for(service_type: str | None) -> int:

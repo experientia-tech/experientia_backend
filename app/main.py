@@ -1,18 +1,34 @@
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import text
+# pyrefly: ignore[missing-import]
+from sqlalchemy import inspect, text
 
 from app.config import get_settings
 from app.database import engine
-from app.routers import auth, users_brands, campaigns, tasks, uploads, exports, geo
+from app.models import CreativeCampaign, CreativeTask, CreativeVerificationLog
+from app.routers import auth, users_brands, campaigns, tasks, uploads, exports, geo, creative
+from app.services.creative_jobs import resume_pending_generations
+# from app.services.creative_jobs import start_scheduler  # SCHEDULED VERIFICATION (disabled)
 from app.services.storage import storage
 
 settings = get_settings()
 
-app = FastAPI(title=settings.app_name, version="2.0.0")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # SCHEDULED VERIFICATION (disabled) — see app/services/creative_jobs.py to re-enable.
+    # scheduler = start_scheduler()
+    resume_pending_generations()
+    yield
+    # if scheduler:
+    #     scheduler.shutdown(wait=False)
+
+
+app = FastAPI(title=settings.app_name, version="2.0.0", lifespan=lifespan)
 
 # Allow explicit origins from env, plus any CloudFront default URL used in prod.
 app.add_middleware(
@@ -35,6 +51,7 @@ app.include_router(tasks.router)
 app.include_router(uploads.router)
 app.include_router(exports.router)
 app.include_router(geo.router)
+app.include_router(creative.router)
 
 
 def _ensure_brand_member_table() -> None:
@@ -81,6 +98,43 @@ def _ensure_campaign_radius_column() -> None:
 
 
 _ensure_campaign_radius_column()
+
+
+def _ensure_creative_tables() -> None:
+    """Creative side tables — not in original Prisma schema (Campaign/Task stay untouched)."""
+    try:
+        CreativeCampaign.metadata.create_all(
+            engine,
+            tables=[
+                CreativeCampaign.__table__,
+                CreativeTask.__table__,
+                CreativeVerificationLog.__table__,
+            ],
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[experientia] Creative tables ensure skipped: {exc}")
+
+
+_ensure_creative_tables()
+
+
+def _ensure_creative_task_columns() -> None:
+    """Columns added to CreativeTask after it first shipped."""
+    columns = {
+        "codeMissing": "BOOLEAN NOT NULL DEFAULT FALSE",
+    }
+    try:
+        # SQLite has no ADD COLUMN IF NOT EXISTS, so check first (works for both).
+        have = {c["name"] for c in inspect(engine).get_columns("CreativeTask")}
+        with engine.begin() as conn:
+            for name, ddl in columns.items():
+                if name not in have:
+                    conn.execute(text(f'ALTER TABLE "CreativeTask" ADD COLUMN "{name}" {ddl}'))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[experientia] CreativeTask columns ensure skipped: {exc}")
+
+
+_ensure_creative_task_columns()
 
 if settings.use_s3:
     storage.ensure_bucket_cors()

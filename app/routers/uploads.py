@@ -8,7 +8,7 @@ from sqlalchemy.orm import joinedload
 
 from app.auth import CurrentUser, DbSession, user_is_manager, ManagerUser
 from app.models import Task
-from app.schemas import PresignRequest, PresignResponse, BrandPresignRequest
+from app.schemas import PresignRequest, PresignResponse, BrandPresignRequest, CreativePresignRequest
 from app.services.storage import storage
 from app.config import get_settings
 
@@ -84,6 +84,22 @@ def presign_brand(payload: BrandPresignRequest, user: ManagerUser):
         payload.filename,
     )
     upload_url, use_direct = storage.presign_put(key, payload.content_type or "image/jpeg")
+    return PresignResponse(
+        upload_url=upload_url,
+        storage_key=key,
+        public_url=storage.public_url(key),
+        use_direct_put=use_direct,
+    )
+
+
+@router.post("/presign-creative", response_model=PresignResponse)
+def presign_creative(payload: CreativePresignRequest, user: ManagerUser):
+    """Presign the source image for a Creative campaign (pass the key to POST /api/campaigns)."""
+    ct = (payload.content_type or "image/jpeg").lower()
+    if ct not in ("image/jpeg", "image/jpg", "image/png", "image/webp"):
+        raise HTTPException(status_code=400, detail="Creative image must be JPG, PNG or WebP")
+    key = storage.make_creative_source_key(payload.filename)
+    upload_url, use_direct = storage.presign_put(key, ct)
     return PresignResponse(
         upload_url=upload_url,
         storage_key=key,

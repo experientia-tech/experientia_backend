@@ -2,7 +2,18 @@
 
 from __future__ import annotations
 
-from app.models import Campaign, Task, User, CampaignMember, CampaignRole, TaskStatus, Brand
+from app.models import (
+    Campaign,
+    Task,
+    User,
+    CampaignMember,
+    CampaignRole,
+    TaskStatus,
+    Brand,
+    CreativeCampaign,
+    CreativeGenerationStatus,
+    CreativeTask,
+)
 from app.schemas import (
     UserOut,
     BrandOut,
@@ -11,6 +22,9 @@ from app.schemas import (
     CampaignListItem,
     CampaignOut,
     MemberOut,
+    CreativeTaskOut,
+    CreativeCampaignOut,
+    CreativeReportItem,
 )
 from app.media_rules import (
     photos_for,
@@ -19,6 +33,7 @@ from app.media_rules import (
     normalize_service_type,
     DEFAULT_RADIUS_KM,
     campaign_radius_km,
+    CREATIVE_SERVICE,
 )
 from app.services.storage import storage
 from app.services.geo import within_radius
@@ -135,6 +150,75 @@ def resolve_sequence_number(task: Task, sequence_number: int = 0) -> int:
     return n if n > 0 else 0
 
 
+def _enum_value(v) -> str | None:
+    if v is None:
+        return None
+    return v.value if hasattr(v, "value") else str(v)
+
+
+def creative_task_out(ct: CreativeTask) -> CreativeTaskOut:
+    return CreativeTaskOut(
+        verification_code=ct.verificationCode,
+        generated_image_url=(
+            storage.viewable_url(ct.generatedImageUrl, ct.generatedImageKey)
+            if ct.generatedImageKey
+            else None
+        ),
+        verification_status=_enum_value(ct.verificationStatus),
+        detected_code=ct.detectedCode,
+        detection_method=_enum_value(ct.detectionMethod),
+        verification_notes=ct.verificationNotes,
+        code_missing=bool(ct.codeMissing),
+        proof_uploaded_at=ct.proofUploadedAt,
+        verified_at=ct.verifiedAt,
+    )
+
+
+def creative_campaign_out(cc: CreativeCampaign) -> CreativeCampaignOut:
+    return CreativeCampaignOut(
+        source_image_url=storage.viewable_url(cc.sourceImageUrl, cc.sourceImageKey),
+        generation_status=_enum_value(cc.generationStatus),
+        generated_count=cc.generatedCount or 0,
+        generation_error=cc.generationError,
+        # Stale while a newer run is pending/processing (new tasks or changed codes).
+        print_pdf_ready=bool(cc.printPdfKey)
+        and cc.generationStatus == CreativeGenerationStatus.COMPLETED,
+        print_pdf_pages=cc.printPdfPages,
+        print_pdf_generated_at=cc.printPdfAt,
+    )
+
+
+def creative_report_item(ct: CreativeTask, task: Task, executor: User | None) -> CreativeReportItem:
+    return CreativeReportItem(
+        task_id=task.id,
+        sequence_number=resolve_sequence_number(task),
+        executor_user_id=task.executorUserId,
+        executor_name=(
+            f"{executor.firstName} {executor.lastName}".strip() if executor else None
+        ),
+        verification_code=ct.verificationCode,
+        verification_status=_enum_value(ct.verificationStatus),
+        detected_code=ct.detectedCode,
+        detection_method=_enum_value(ct.detectionMethod),
+        ocr_confidence=ct.ocrConfidence,
+        generated_image_url=(
+            storage.viewable_url(ct.generatedImageUrl, ct.generatedImageKey)
+            if ct.generatedImageKey
+            else None
+        ),
+        proof_image_url=(
+            storage.viewable_url(ct.proofImageUrl, ct.proofImageKey)
+            if ct.proofImageUrl
+            else None
+        ),
+        proof_uploaded_at=ct.proofUploadedAt,
+        verified_at=ct.verifiedAt,
+        verification_attempts=ct.verificationAttempts or 0,
+        verification_notes=ct.verificationNotes,
+        code_missing=bool(ct.codeMissing),
+    )
+
+
 def task_out(task: Task, sequence_number: int = 0, image_limit: int | None = 1) -> TaskOut:
     """image_limit=1 keeps campaign grids fast; None = all images."""
     campaign = task.campaign
@@ -208,6 +292,12 @@ def task_out(task: Task, sequence_number: int = 0, image_limit: int | None = 1) 
         flagged=task.flagged,
         created_at=task.createdAt,
         completed_at=task.completedAt,
+        # Only Creative tasks touch the relationship, so other grids skip the extra query.
+        creative=(
+            creative_task_out(task.creative)
+            if service == CREATIVE_SERVICE and task.creative
+            else None
+        ),
     )
 
 
@@ -328,4 +418,9 @@ def campaign_out(
         tasks_page=page,
         tasks_page_size=page_size,
         tasks_total=tasks_total if tasks_total is not None else task_count,
+        creative=(
+            creative_campaign_out(c.creative)
+            if normalize_service_type(c.serviceType) == CREATIVE_SERVICE and c.creative
+            else None
+        ),
     )

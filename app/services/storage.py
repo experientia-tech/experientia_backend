@@ -1,5 +1,7 @@
+import shutil
 import uuid
 from pathlib import Path
+from typing import Iterator
 
 import boto3
 from botocore.client import Config
@@ -11,6 +13,8 @@ settings = get_settings()
 
 class StorageService:
     """S3 when configured (exp-tech); local disk fallback."""
+
+    CREATIVE_SOURCE_PREFIX = "gig-management/creatives/sources/"
 
     def __init__(self) -> None:
         self.upload_dir = Path(settings.upload_dir)
@@ -39,6 +43,19 @@ class StorageService:
             ext = ".jpg"
         prefix = brand_id or "new"
         return f"gig-management/brands/{prefix}/{uuid.uuid4().hex}{ext}"
+
+    def make_creative_source_key(self, filename: str) -> str:
+        ext = Path(filename).suffix.lower() or ".jpg"
+        if ext not in (".jpg", ".jpeg", ".png", ".webp"):
+            ext = ".jpg"
+        return f"{self.CREATIVE_SOURCE_PREFIX}{uuid.uuid4().hex}{ext}"
+
+    def make_creative_key(self, campaign_id: str, task_id: str) -> str:
+        # Deterministic per task so a retried generation job overwrites, never orphans.
+        return f"gig-management/creatives/{campaign_id}/{task_id}.jpg"
+
+    def make_creative_print_key(self, campaign_id: str) -> str:
+        return f"gig-management/creatives/{campaign_id}/print.pdf"
 
     def public_url(self, key: str) -> str:
         if settings.use_s3:
@@ -72,6 +89,35 @@ class StorageService:
         )
         return self.public_url(key)
 
+    def upload_file(self, key: str, path: Path, content_type: str) -> str:
+        """Upload a file from disk without loading it into memory (multipart on S3)."""
+        if not self._s3:
+            dest = self.upload_dir / key
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(path, dest)
+            return self.public_url(key)
+        self._s3.upload_file(
+            str(path), settings.s3_bucket, key, ExtraArgs={"ContentType": content_type}
+        )
+        return self.public_url(key)
+
+    def iter_bytes(self, key: str, chunk_size: int = 1024 * 1024) -> Iterator[bytes] | None:
+        """Stream an object in chunks, or None if it does not exist."""
+        local = self.resolve_local_path(key)
+        if local:
+            def from_disk() -> Iterator[bytes]:
+                with local.open("rb") as fh:
+                    while chunk := fh.read(chunk_size):
+                        yield chunk
+            return from_disk()
+        if not self._s3:
+            return None
+        try:
+            body = self._s3.get_object(Bucket=settings.s3_bucket, Key=key)["Body"]
+        except Exception:
+            return None
+        return body.iter_chunks(chunk_size)
+
     def save_local(self, key: str, data: bytes) -> str:
         path = self.upload_dir / key
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -82,8 +128,8 @@ class StorageService:
         path = self.upload_dir / key
         return path if path.exists() else None
 
-    def get_bytes(self, key: str | None, url: str) -> bytes | None:
-        cache_key = key or self.key_from_url(url or "")
+    def get_bytes(self, key: str | None, url: str, *, cache: bool = True) -> bytes | None:
+        cache_key = (key or self.key_from_url(url or "")) if cache else None
         if cache_key and cache_key in self._bytes_cache:
             return self._bytes_cache[cache_key]
 

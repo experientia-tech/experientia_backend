@@ -5,6 +5,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse, FileResponse
+from PIL import Image
 from sqlalchemy import func, case
 from sqlalchemy.orm import joinedload
 
@@ -28,6 +29,7 @@ from app.models import (
     CampaignMember,
     CampaignRole,
     TaskStatus,
+    CreativeCampaign,
 )
 from app.schemas import (
     CampaignCreate,
@@ -40,8 +42,12 @@ from app.schemas import (
     CampaignAssignSupervisors,
 )
 from app.serializers import campaign_list_item_from_counts, campaign_out, resolve_sequence_number
-from app.media_rules import normalize_service_type, campaign_radius_km
+from app.config import get_settings
+from app.media_rules import normalize_service_type, campaign_radius_km, is_creative
+from app.services.creative import ensure_task_codes
+from app.services.creative_jobs import enqueue_generation
 from app.services.geo import random_points_in_radius
+from app.services.storage import storage
 from app.services.pdf import build_campaign_pdf
 from app.services.pdf_jobs import start_export_job, get_job, list_campaign_jobs
 
@@ -204,11 +210,44 @@ def list_campaigns(db: DbSession, user: CurrentUser):
     return result
 
 
+_CREATIVE_SOURCE_MAX_BYTES = 25 * 1024 * 1024
+
+
+def _creative_source(payload: CampaignCreate) -> tuple[str, str]:
+    """Validate the uploaded source image for a Creative campaign → (key, url)."""
+    max_tasks = get_settings().creative_max_tasks
+    if payload.total_tasks > max_tasks:
+        raise HTTPException(
+            status_code=400, detail=f"Creative campaigns allow at most {max_tasks} tasks"
+        )
+    key = (payload.source_image_key or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="Creative campaigns need a source image")
+    if ".." in key or not key.startswith(storage.CREATIVE_SOURCE_PREFIX):
+        raise HTTPException(status_code=400, detail="Invalid source image key")
+    data = storage.get_bytes(key, "", cache=False)
+    if not data:
+        raise HTTPException(status_code=400, detail="Source image not found — upload it first")
+    if len(data) > _CREATIVE_SOURCE_MAX_BYTES:
+        raise HTTPException(status_code=400, detail="Source image too large (max 25MB)")
+    try:
+        img = Image.open(io.BytesIO(data))
+        fmt = img.format
+        img.verify()
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="Source image is not a valid image")
+    if fmt not in ("JPEG", "PNG", "WEBP"):
+        raise HTTPException(status_code=400, detail="Source image must be JPG, PNG or WebP")
+    return key, storage.public_url(key)
+
+
 @router.post("", response_model=CampaignOut)
 def create_campaign(payload: CampaignCreate, db: DbSession, user: ManagerUser):
     service = normalize_service_type(payload.service_type)
     if payload.start_date and payload.end_date and payload.end_date < payload.start_date:
         raise HTTPException(status_code=400, detail="End date must be on or after start date")
+    creative = is_creative(service)
+    source = _creative_source(payload) if creative else None
     if payload.brand_id:
         brand = (
             db.query(Brand)
@@ -276,10 +315,27 @@ def create_campaign(payload: CampaignCreate, db: DbSession, user: ManagerUser):
 
     if executors:
         _generate_tasks(db, campaign, executors)
+    elif creative:
+        # Codes need task rows up front; the manager owns them until executors are assigned.
+        campaign.totalTasks = 0
+        _add_campaign_tasks(db, campaign, payload.total_tasks, None, user.id, manager_owned=True)
+
+    if creative:
+        db.add(
+            CreativeCampaign(
+                campaignId=campaign.id,
+                sourceImageKey=source[0],
+                sourceImageUrl=source[1],
+            )
+        )
+        db.flush()
+        ensure_task_codes(db, campaign.id)
 
     _attach_brand_supervisors(db, campaign, user.id)
 
     db.commit()
+    if creative:
+        enqueue_generation(campaign.id)
     return _get_campaign_detail(campaign.id, db, user)
 
 
@@ -604,6 +660,13 @@ def add_campaign_tasks(
     campaign = _load_campaign_base(db, campaign_id)
     if not campaign or campaign.organizationId != user.organizationId:
         raise HTTPException(status_code=404, detail="Campaign not found")
+    creative = is_creative(campaign.serviceType)
+    if creative:
+        max_tasks = get_settings().creative_max_tasks
+        if int(campaign.totalTasks or 0) + payload.count > max_tasks:
+            raise HTTPException(
+                status_code=400, detail=f"Creative campaigns allow at most {max_tasks} tasks"
+            )
     task_ids = _add_campaign_tasks(
         db,
         campaign,
@@ -612,7 +675,11 @@ def add_campaign_tasks(
         user.id,
         manager_owned=payload.manager_owned,
     )
+    if creative:
+        ensure_task_codes(db, campaign.id)
     db.commit()
+    if creative:
+        enqueue_generation(campaign.id)
     return CampaignAddTasksResponse(
         campaign=_get_campaign_detail(campaign_id, db, user),
         task_ids=task_ids,
@@ -655,8 +722,12 @@ def assign_campaign_executors(
         for i, t in enumerate(tasks):
             t.executorUserId = executors[i % len(executors)].id
 
+    new_codes = ensure_task_codes(db, campaign.id) if is_creative(campaign.serviceType) else 0
+
     campaign.updatedAt = datetime.utcnow()
     db.commit()
+    if new_codes:
+        enqueue_generation(campaign.id)
     return _get_campaign_detail(campaign_id, db, user)
 
 

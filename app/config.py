@@ -71,6 +71,18 @@ class Settings(BaseSettings):
     seed_demo: bool = False
     create_tables: bool = False
 
+    # Creative campaigns (code-stamped images + scheduled proof verification)
+    creative_max_tasks: int = 1000
+    # When pending proofs are checked (cron). Empty string disables the scheduled job.
+    # Currently unused: scheduled verification is commented out (see creative_jobs.py).
+    creative_verify_cron: str = "0 * * * *"
+    creative_verify_timezone: str = "Asia/Kolkata"
+    creative_verify_batch_size: int = 50
+    creative_verify_max_attempts: int = 3
+    creative_ocr_min_confidence: float = 60.0
+    creative_verify_on_upload: bool = False
+    creative_ocr_provider: str = "tesseract"
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]

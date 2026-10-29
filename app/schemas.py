@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
@@ -103,6 +104,19 @@ class ProofImageOut(BaseModel):
     captured_at: str | None = None
 
 
+class CreativeTaskOut(BaseModel):
+    verification_code: str | None = None
+    generated_image_url: str | None = None
+    verification_status: str
+    detected_code: str | None = None
+    detection_method: str | None = None
+    verification_notes: str | None = None
+    # The automatic check found no task's code in the proof photo.
+    code_missing: bool = False
+    proof_uploaded_at: datetime | None = None
+    verified_at: datetime | None = None
+
+
 class TaskOut(BaseModel):
     id: UUID
     campaign_id: UUID
@@ -130,6 +144,7 @@ class TaskOut(BaseModel):
     flagged: bool = False
     created_at: datetime
     completed_at: datetime | None = None
+    creative: CreativeTaskOut | None = None
 
 
 class ExecutorCampaignSummary(BaseModel):
@@ -183,6 +198,8 @@ class CampaignCreate(BaseModel):
     executor_ids: list[UUID] = []
     start_date: datetime | None = None
     end_date: datetime | None = None
+    # Creative only: storage_key from /api/uploads/presign-creative, after uploading
+    source_image_key: str | None = None
 
 
 class CampaignUpdate(BaseModel):
@@ -245,6 +262,16 @@ class MemberOut(BaseModel):
     active: bool = True
 
 
+class CreativeCampaignOut(BaseModel):
+    source_image_url: str
+    generation_status: str
+    generated_count: int = 0
+    generation_error: str | None = None
+    print_pdf_ready: bool = False
+    print_pdf_pages: int | None = None
+    print_pdf_generated_at: datetime | None = None
+
+
 class CampaignOut(CampaignListItem):
     description: str = ""
     photos_per_task: int = 1
@@ -257,6 +284,7 @@ class CampaignOut(CampaignListItem):
     tasks_page: int = 1
     tasks_page_size: int = 24
     tasks_total: int = 0
+    creative: CreativeCampaignOut | None = None
 
 
 class CampaignAddTasksResponse(BaseModel):
@@ -270,6 +298,11 @@ class PresignRequest(BaseModel):
     task_id: UUID
 
 
+class CreativePresignRequest(BaseModel):
+    filename: str
+    content_type: str = "image/jpeg"
+
+
 class BrandPresignRequest(BaseModel):
     filename: str
     content_type: str = "image/jpeg"
@@ -281,3 +314,54 @@ class PresignResponse(BaseModel):
     storage_key: str
     public_url: str
     use_direct_put: bool
+
+
+class CreativeReportTotals(BaseModel):
+    total_tasks: int = 0
+    not_submitted: int = 0
+    pending_verification: int = 0
+    verified: int = 0
+    failed: int = 0
+    needs_review: int = 0
+    success_rate: float = 0.0  # verified ÷ submitted proofs, %
+
+
+class CreativeReportItem(BaseModel):
+    task_id: UUID
+    sequence_number: int = 0
+    executor_user_id: UUID
+    executor_name: str | None = None
+    verification_code: str | None = None
+    verification_status: str
+    detected_code: str | None = None
+    detection_method: str | None = None
+    ocr_confidence: float | None = None
+    generated_image_url: str | None = None
+    proof_image_url: str | None = None
+    proof_uploaded_at: datetime | None = None
+    verified_at: datetime | None = None
+    verification_attempts: int = 0
+    verification_notes: str | None = None
+    code_missing: bool = False
+
+
+class CreativeReport(BaseModel):
+    campaign_id: UUID
+    campaign_name: str
+    generation: CreativeCampaignOut
+    totals: CreativeReportTotals
+    items: list[CreativeReportItem]
+    page: int = 1
+    page_size: int = 50
+    items_total: int = 0
+    # e.g. "every hour"; None when scheduled checks are off (only "Verify now").
+    verify_schedule: str | None = None
+
+
+class CreativeCodeUpdate(BaseModel):
+    code: str | None = None  # omit to generate a fresh code
+
+
+class CreativeManualVerify(BaseModel):
+    status: Literal["VERIFIED", "FAILED"]
+    note: str | None = None
